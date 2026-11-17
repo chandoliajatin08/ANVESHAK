@@ -1,242 +1,203 @@
-# ANVESHAK — IoT Live Safety & Environmental Monitoring System
+# ANVESHAK — AI-Powered Smart Helmet for Underground Mine Safety
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Frontend](https://img.shields.io/badge/Frontend-React%2019%20%7C%20Vite%20%7C%20Tailwind-cyan)](https://react.dev/)
 [![Backend](https://img.shields.io/badge/Backend-Node.js%20%7C%20Express%20%7C%20SerialPort-green)](https://nodejs.org/)
-[![Hardware](https://img.shields.io/badge/Hardware-ESP32%20%7C%20MQ--2%20%7C%20MPU6050-red)](https://espressif.com/)
+[![Hardware](https://img.shields.io/badge/Hardware-ESP32%20%7C%20LoRa%20%7C%20MQ--2%20%7C%20MQ--4%20%7C%20MPU6050-red)](https://espressif.com/)
 
-**ANVESHAK** (*Sanskrit for "Explorer / Investigator"*) is a real-time edge-to-cloud safety telemetry system designed to monitor hazardous environmental conditions, gas/smoke concentrations, worker orientation, and emergency SOS signals in real time.
+**ANVESHAK** (Sanskrit for *"explorer / investigator"*) is a wearable smart helmet for underground miners. It detects gas, falls and SOS on the helmet itself, warns the miner instantly, and sends alerts to the rescue team over **LoRa radio — no mobile network or internet needed underground**. On the rescue team's laptop, an **AI risk engine** predicts rising gas danger and ranks each miner by risk, so rescuers know who to reach first.
 
-The system combines an **ESP32 microcontroller edge node** with an **Express.js ingestion microservice** and a **React 19 mission-control web dashboard**, delivering live sensor feeds with zero synthetic interpolation in live mode.
-
----
-
-## 📌 Problem Statement
-
-Industrial personnel, mining workers, and disaster response teams frequently operate in hazardous environments susceptible to:
-- Invisible toxic gas accumulation and flammable smoke leaks (LPG, Propane, Methane, Smoke).
-- Physical trauma, sudden falls, impacts, and disorientation.
-- Thermal stress and equipment overheating.
-- Communication blackouts where standard consumer Wi-Fi or cellular networks are unavailable.
-
-Traditional stationary monitors lack individual worker telemetry, while disconnected wearable alarms fail to notify remote supervisors instantly. ANVESHAK addresses this by providing localized on-device safety alarms alongside high-frequency telemetry streaming to centralized monitoring dashboards.
+Built by **Team Project X** (Vivekananda Global University) for the problem statement *"AI-Powered Underground Mine Safety, Monitoring and Rescue System"* (theme: Smart Automation).
 
 ---
 
-## 🎯 Project Objectives
+## Problem
 
-1. **Multi-Hazard Edge Telemetry**: Continuously sample gas/smoke levels, 6-axis spatial motion, attitude (roll/pitch), and temperature directly at the edge.
-2. **Immediate Local Alerting**: Trigger a piercing 2000 Hz acoustic piezo buzzer on the edge device whenever gas thresholds ($\ge 1000\text{ ADC}$) or emergency SOS triggers are breached.
-3. **Dual-Channel Telemetry Stream**: Support direct USB cable serial streaming (115200 baud) for zero-dependency local operation as well as Wi-Fi HTTP POST and cloud synchronization.
-4. **Mission-Control Web Interface**: Present live readings, waveform histories, 3D attitude representations, and an exact virtual mirror of the physical 0.96-inch OLED screen.
-5. **Truthful Status Indication**: Implement automatic heartbeat timeouts ($15\text{ seconds}$) that flag the device as offline rather than displaying stale or fabricated sensor values.
+Underground miners face gas leaks, falls and roof collapses, and with no network underground, rescue teams often learn too late. In 2024, Indian coal mines recorded **38 fatal accidents** (DGMS Annual Report 2024, provisional). Fixed gas monitors don't move with the miner, simple wearable alarms only warn the person wearing them, and radio links fail through rock.
+
+## Solution
+
+| Layer | What it does |
+| --- | --- |
+| **Helmet node (ESP32)** | MQ-4 (methane) and MQ-2 (smoke / combustible gas) sensing, MPU6050 fall detection, SOS button, OLED, buzzer, LED and voice alerts (DFPlayer). All local alerts work **without** the laptop. |
+| **LoRa link (433 MHz)** | The helmet sends a compact packet every second, and immediately on any alert, to a LoRa gateway. |
+| **Gateway (ESP32 #2)** | Receives LoRa packets, adds signal strength (RSSI/SNR) and forwards them to the laptop over USB. |
+| **Backend (`backend/anveshak-server.js`)** | Reads the gateway, runs the **AI risk engine**, streams live data to the dashboard (Server-Sent Events), optional Firebase sync. |
+| **Dashboard (React)** | Live sensors, AI risk panel, alerts and SOS, history with CSV export, link health. |
 
 ---
 
-## ⚙️ System Architecture & Data Flow
+## System Architecture
 
 ```mermaid
-graph TD
-    subgraph "Edge Hardware Layer"
-        MQ2["MQ-2 Gas Sensor\n(GPIO 34 ADC)"] --> ESP32["ESP32 Microcontroller\n(240MHz Dual-Core)"]
-        MPU["MPU-6050 IMU\n(I2C 0x68)"] --> ESP32
-        OLED["SSD1306 0.96'' OLED\n(I2C 0x3C)"] <-- ESP32
-        BUZZ["Active Buzzer\n(GPIO 25 PWM 2000Hz)"] <-- ESP32
-        LORA["SX1278 LoRa 433MHz\n(SPI Transceiver)"] <-- ESP32
+graph LR
+    subgraph Helmet["Helmet node (ESP32)"]
+        MQ4["MQ-4 methane"] --> H[ESP32]
+        MQ2["MQ-2 gas/smoke"] --> H
+        MPU["MPU6050 motion"] --> H
+        SOS["SOS button"] --> H
+        H --> LOCAL["OLED + buzzer + LED + voice (DFPlayer)"]
     end
-
-    subgraph "Ingestion & Bridge Layer (Port 5000)"
-        ESP32 -- "USB Serial (115200 baud)\n[ANVESHAK_DATA] / Raw Text" --> BRIDGE["Node.js Express Server\n(backend/server.js)"]
-        ESP32 -. "Wi-Fi HTTP POST\n(/api/ingest)" .-> BRIDGE
-        BRIDGE -- "Optional Non-blocking" --> RTDB["Firebase Realtime Database\n(/devices/ANVESHAK-ESP32-01)"]
-    end
-
-    subgraph "Frontend Presentation Layer (Port 5173)"
-        BRIDGE -- "Server-Sent Events (SSE)\nGET /api/stream" --> UI["React 19 Dashboard\n(Vite + Tailwind CSS)"]
-        BRIDGE -- "1s Snapshot Polling\nGET /api/latest" --> UI
-        RTDB -. "Client SDK Listener\n(Optional Cloud Mode)" .-> UI
-        UI --> AUDIO["Web Audio API\n(2000 Hz Piezo Siren)"]
-    end
+    H -- "LoRa 433 MHz" --> GW["Gateway ESP32 + LoRa"]
+    H -. "USB cable (fallback)" .-> BE
+    GW -- "USB serial" --> BE["Backend: anveshak-server.js + AI engine"]
+    BE -- "Server-Sent Events" --> UI["React dashboard"]
+    BE -. "optional" .-> FB["Firebase RTDB"]
 ```
 
 ---
 
-## 🛠️ Hardware Components & Bill of Materials
+## AI Risk Engine (`backend/ai-engine.js`)
 
-| Component | Model / Spec | Purpose in System |
-| :--- | :--- | :--- |
-| **Microcontroller** | ESP32-WROOM-32D | Edge compute, ADC acquisition, I2C/SPI master, telemetry transmission |
-| **Gas & Smoke Sensor** | MQ-2 Analog Detector | Measures combustible gas and smoke concentration (0–4095 12-bit ADC) |
-| **Motion Sensor** | MPU-6050 6-Axis IMU | 3-axis accelerometer ($\pm 2g$), 3-axis gyroscope ($\pm 250^\circ/\text{s}$), internal temperature |
-| **Local Display** | SSD1306 0.96" OLED | 128x64 monochrome screen cycling through Gas, Motion, and Connectivity pages |
-| **Acoustic Alarm** | Active Piezo Buzzer | 2000 Hz pulse siren driven via LEDC PWM (GPIO 25) |
-| **Long-Range RF** | SX1278 (Ra-02) LoRa | 433 MHz SPI packet telemetry for remote transmission |
-| **Power Supply** | 5V / 2A Micro-USB | Powers ESP32, sensor heating elements, and displays |
+Runs on every packet:
 
----
+1. **Gas trend prediction** — fits a straight line (linear regression) to the last 60 s of gas readings and predicts the **time until the danger level**, e.g. *"Danger level predicted in ~4 min"*.
+2. **Gas anomaly detection** — flags **sudden spikes** far above the recent average (z-score), even below the danger threshold.
+3. **Fall confidence** — the helmet confirms falls itself (free fall → impact → lying still + tilted). The engine scores how strongly each impact matches a real fall using the features the helmet sends (peak g, free-fall minimum, tilt, stillness).
+4. **Explainable miner risk score (0–100)** — gas level (up to 40), gas trend/spike (up to 15), fall (30), no movement after a fall (20) or for a long time (10). **SOS sets the score to 100.** Every point comes with a reason shown on the dashboard.
 
-## 🔌 Hardware Pinout Matrix
+Test it without hardware:
 
-Based on the actual verified firmware implementation in [`hardware/anveshak_esp32_firmware/anveshak_esp32_firmware.ino`](./hardware/anveshak_esp32_firmware/anveshak_esp32_firmware.ino):
+```bash
+cd backend
+npm install
+npm run test:ai
+```
 
-| Peripheral | ESP32 Pin | Interface / Bus | Signal Description |
-| :--- | :--- | :--- | :--- |
-| **MQ-2 Analog Out** | **GPIO 34** | ADC1_CH6 | 12-bit Analog Input (`analogSetPinAttenuation(ADC_11db)`) |
-| **Buzzer (+)** | **GPIO 25** | LEDC PWM (Ch 0) | 2000 Hz Square Wave, 8-bit resolution |
-| **MPU-6050 SDA** | **GPIO 21** | I2C (Shared Bus) | Serial Data @ 100 kHz (I2C address `0x68`) |
-| **MPU-6050 SCL** | **GPIO 22** | I2C (Shared Bus) | Serial Clock @ 100 kHz |
-| **SSD1306 OLED SDA**| **GPIO 21** | I2C (Shared Bus) | Display Data (I2C address `0x3C`) |
-| **SSD1306 OLED SCL**| **GPIO 22** | I2C (Shared Bus) | Display Clock |
-| **SX1278 LoRa SCK** | **GPIO 18** | SPI Bus | SPI Clock |
-| **SX1278 LoRa MISO**| **GPIO 19** | SPI Bus | Master In Slave Out |
-| **SX1278 LoRa MOSI**| **GPIO 23** | SPI Bus | Master Out Slave In |
-| **SX1278 LoRa NSS** | **GPIO 05** | GPIO Output | SPI Chip Select |
-| **SX1278 LoRa RST** | **GPIO 14** | GPIO Output | Module Hardware Reset |
-| **SX1278 LoRa DIO0**| **GPIO 26** | GPIO Input | Packet Tx/Rx Interrupt |
+**Planned:** a trained ML fall classifier (Random Forest on recorded MPU6050 data: falls vs sitting, bending, walking, dropping the helmet), compared against the current rule-based detection.
 
 ---
 
-## 💻 Software Technologies Used
+## Hardware
 
-### Frontend
-- **React 19** (`react` & `react-dom` v19.2.8)
-- **Vite 8** (`vite` v8.3.4, `@vitejs/plugin-react` v6.1.1)
-- **Tailwind CSS 3** (`tailwindcss` v3.4.19, `autoprefixer`, `postcss`)
-- **Recharts** (`recharts` v3.10.1) — Real-time waveform trend charts with brush zoom
-- **Lucide React** (`lucide-react` v1.55.0) — Technical dashboard iconography
-- **Web Audio API** — Hardware-calibrated 2000 Hz square-wave synthesizer
+### Bill of materials (per helmet + one gateway)
 
-### Backend Microservice
-- **Node.js** (ES Modules, `node:http`)
-- **Express 4** (`express` v4.21.2)
-- **SerialPort** (`serialport` v13.0.0, `@serialport/parser-readline`) — Auto-reconnecting USB bridge
-- **Firebase Admin SDK** (`firebase-admin` v13.1.0) — Optional cloud push
-- **dotenv** & **cors**
+| Component | Purpose |
+| --- | --- |
+| ESP32 DevKit V1 × 2 | Helmet controller + gateway |
+| LoRa Ra-02 (SX1278, 433 MHz) × 2 + 433 MHz antennas | Wireless link without internet |
+| MQ-4 gas sensor | Methane (main explosive gas in coal mines) |
+| MQ-2 gas sensor | Smoke / LPG / combustible gases |
+| MPU6050 | Fall and movement detection |
+| 0.96" SSD1306 OLED | Status on the helmet |
+| DFPlayer Mini + small 8 Ω speaker + microSD | Voice alerts |
+| Buzzer, red LED, push button | Audible / visible alerts, SOS |
+| 18650 cell, TP4056 (with protection), MT3608 boost (5 V) | Battery power |
 
-### Microcontroller Firmware
-- **Arduino C / C++** on ESP-IDF core (v2.x / v3.x compatible)
-- **Adafruit GFX** & **Adafruit SSD1306**
-- **Sandeep Mistry LoRa** library
-- **BlynkSimpleEsp32** (optional secondary sync)
+### Helmet pin map
 
----
+| Module | Module pin | ESP32 pin | Power | Notes |
+| --- | --- | --- | --- | --- |
+| MQ-2 | AO | GPIO 34 | 5 V | Through 10 kΩ/10 kΩ divider (AO → 10k → GPIO → 10k → GND) |
+| MQ-4 | AO | GPIO 35 | 5 V | Same divider |
+| MPU6050 | SDA / SCL | GPIO 21 / 22 | 3.3 V | I²C 0x68 |
+| OLED | SDA / SCL | GPIO 21 / 22 | 3.3 V | I²C 0x3C (shared bus) |
+| LoRa Ra-02 | SCK / MISO / MOSI | GPIO 18 / 19 / 23 | **3.3 V only** | Antenna attached before power-on |
+| LoRa Ra-02 | NSS / RST / DIO0 | GPIO 5 / 14 / 26 | | |
+| DFPlayer | RX / TX | GPIO 17 (via 1 kΩ) / GPIO 16 | 5 V | Speaker on SPK1 / SPK2 |
+| SOS button | one leg | GPIO 4 | | Other leg to GND (INPUT_PULLUP) |
+| Buzzer | + | GPIO 25 | | |
+| Alert LED | anode | GPIO 32 (via 220 Ω) | | |
 
-## 📊 Features Implemented & Verified
+The **gateway** uses the same LoRa pins (and an optional OLED on GPIO 21/22) and is powered by the laptop's USB.
 
-### ✅ Working & Verified
-- [x] **Real-Time USB Serial Bridge**: Automatically discovers ESP32 on `COM14` (115200 baud), parses hardware text telemetry and JSON packets, and publishes live frames to the UI every 1000 ms.
-- [x] **HTTP Ingestion Endpoint**: `POST /api/ingest` accepts JSON packets from Wi-Fi-enabled edge nodes.
-- [x] **Server-Sent Events (SSE)**: `GET /api/stream` streams live hardware telemetry frames directly into the browser with zero polling lag.
-- [x] **Critical Threshold Alarm**: Gas threshold is set to **$\ge 1000\text{ ADC}$**. Readings $\ge 1000$ trigger the physical GPIO 25 buzzer and the 2000 Hz dashboard audio alarm.
-- [x] **Virtual 0.96" OLED Mirror**: High-fidelity 128x64 display mirror in the web dashboard replicating the physical display's 3-page cyclic view.
-- [x] **3D Attitude Orientation Cube**: Real-time roll/pitch attitude visualizer driven by live MPU-6050 accelerometer and gyroscope data.
-- [x] **Historical Analytics & CSV Export**: Date range filtering presets (*1h*, *6h*, *24h*, *7d*, *Custom*), multi-metric waveforms, and one-click CSV dataset download.
-- [x] **Device Diagnostics Screen**: Real-time MCU registers, free SRAM heap, flash memory, and peripheral health indicators.
+### LoRa packet format
 
-### 🟡 Planned / Prototype Stage
-- [ ] **End-to-End LoRa Gateway**: LoRa packet transmission is implemented on the edge node; remote gateway receiver station is in prototype testing.
-- [ ] **Clinical Fall Detection Validation**: Fall impacts are flagged using a resultant $G$-force threshold ($\ge 2.5g$); machine-learning-based activity classification is planned.
-- [ ] **Server-Side Firebase Admin Key**: Firebase RTDB synchronization operates via client credentials; dedicated service-account key injection for the Node backend is pending.
+```
+ANV,device,loraSeq,status,sos,fall,mq2Adc,mq2Ppm,mq4Adc,mq4Ppm,ax,ay,az,gx,gy,gz,devTemp,roll,pitch,impactId,peakG,minG,peakGyro,tilt,still
+```
 
----
-
-## 🚀 Getting Started
-
-### 1. Prerequisites
-- [Node.js](https://nodejs.org/) (v18.0.0 or higher)
-- [Arduino IDE](https://www.arduino.cc/en/software) (v2.0+) with ESP32 board support package installed
-- USB-to-UART bridge drivers (CP210x or CH340, depending on your ESP32 board)
+The gateway forwards it as `[ANVESHAK_LORA]<packet>|<RSSI>|<SNR>`. The dashboard uses the LoRa sequence number to show packet loss.
 
 ---
 
-### 2. Microcontroller Setup (Hardware)
-1. Open Arduino IDE and install the following libraries via **Library Manager**:
-   - `Adafruit GFX Library`
-   - `Adafruit SSD1306`
-   - `LoRa` by Sandeep Mistry
-   - `Blynk` by Volodymyr Shymanskyy (optional)
-2. Connect your sensors according to the [Hardware Pinout Matrix](#-hardware-pinout-matrix).
-3. Open [`hardware/anveshak_esp32_firmware/anveshak_esp32_firmware.ino`](./hardware/anveshak_esp32_firmware/anveshak_esp32_firmware.ino).
-4. Update the Wi-Fi credentials and local IP address (or leave them default if streaming over USB):
-   ```cpp
-   char ssid[] = "YOUR_WIFI_SSID";
-   char pass[] = "YOUR_WIFI_PASSWORD";
-   #define ANVESHAK_SERVER_URL "http://YOUR_LOCAL_IP:5000/api/ingest"
-   ```
-5. Select **Board**: `ESP32 Dev Module`, select your active **COM Port**, and click **Upload**.
+## Setup
+
+### 1. Helmet firmware — `hardware/anveshak_esp32_firmware/`
+
+1. Arduino IDE 2.x with the **ESP32 board package** (Espressif). Board: **ESP32 Dev Module**.
+2. Libraries: `Adafruit SSD1306`, `Adafruit GFX Library`, `LoRa` (Sandeep Mistry), `DFRobotDFPlayerMini`. (`Blynk` only if you enable it.)
+3. Feature switches at the top of the sketch: `USE_MQ4`, `USE_DFPLAYER`, `USE_WIFI_HTTP` (off by default), `USE_BLYNK` (off), `CALIBRATION_MODE`.
+4. **Gas calibration:** set `CALIBRATION_MODE 1`, upload, keep the helmet in clean air for 20+ minutes, copy the printed `MQ2_R0` and `MQ4_R0` values into the sketch, set `CALIBRATION_MODE 0` and upload again. Until then, raw ADC thresholds are used.
+5. **Voice files:** microSD (FAT32) with a folder `mp3` containing `0001.mp3` (gas warning), `0002.mp3` (gas danger — evacuate), `0003.mp3` (fall detected), `0004.mp3` (SOS sent), `0005.mp3` (alert cleared).
+
+**Button:** short press = SOS. Hold 2 s = cancel SOS / fall ("I'm OK").
+
+### 2. Gateway firmware — `hardware/anveshak_gateway/`
+
+Upload to the second ESP32 and connect it to the laptop by USB. It prints `[GATEWAY] Ready` and then one line per packet received.
+
+### 3. Backend — `backend/anveshak-server.js`
+
+```bash
+cd backend
+npm install
+cp .env.example .env      # Windows: copy .env.example .env
+# set SERIAL_PORT=COM14 (Windows) or /dev/ttyUSB0 (Linux), or leave empty to auto-detect
+npm start
+```
+
+The backend runs on `http://localhost:5000` (`/api/stream`, `/api/latest`, `/api/history`, `POST /api/ingest`, `/health`). Firebase sync is optional and stays off unless configured in `.env`.
+
+**No LoRa? Use the cable:** plug the helmet into the laptop instead of the gateway. The helmet also prints its full data as `[ANVESHAK_DATA]{json}` on USB, so the dashboard works the same way.
+
+### 4. Dashboard
+
+```bash
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`.
 
 ---
 
-### 3. Backend Ingestion Microservice Setup
-1. Open a terminal and navigate to the backend folder:
-   ```bash
-   cd backend
-   npm install
-   ```
-2. Copy the environment template:
-   ```bash
-   copy .env.example .env    # On Windows
-   cp .env.example .env      # On Linux/macOS
-   ```
-3. Start the ingestion microservice:
-   ```bash
-   npm start
-   ```
-   *The server starts on port 5000 and automatically connects to your connected ESP32 on `COM14`.*
+## Project Status
+
+**Working on hardware:** MQ-2 gas sensing, MPU6050 motion sensing, OLED display, buzzer alarm, live dashboard over USB.
+
+**Implemented in code, being tested on hardware:** SOS button, on-helmet fall detection (50 Hz), MQ-4 methane sensing with calibration, DFPlayer voice alerts, LoRa gateway link with RSSI / packet loss, AI risk engine and dashboard AI panel.
+
+**Planned:** trained ML fall classifier, UWB location (UWB tags on helmets + anchors in the tunnel to show each worker's exact position), ambient temperature/humidity sensor (BME280), LoRa relay nodes for long tunnels, mine-map safe-route planning.
+
+> The temperature shown is the **MPU6050 chip temperature**, not the air around the miner.
 
 ---
 
-### 4. Frontend Dashboard Setup
-1. In the project root directory, install frontend dependencies:
-   ```bash
-   npm install
-   ```
-2. Copy the frontend environment template:
-   ```bash
-   copy .env.example .env    # On Windows
-   cp .env.example .env      # On Linux/macOS
-   ```
-3. Start the Vite development server:
-   ```bash
-   npm run dev
-   ```
-4. Open your browser and navigate to **`http://localhost:5173/`**.
+## Repository Structure
+
+```
+ANVESHAK/
+├── hardware/
+│   ├── anveshak_esp32_firmware/   # helmet node firmware
+│   └── anveshak_gateway/          # LoRa receiver gateway firmware
+├── backend/
+│   ├── anveshak-server.js         # backend server (serial / HTTP ingestion, SSE stream)
+│   ├── ai-engine.js               # AI risk engine
+│   ├── lora-parser.js             # LoRa gateway line parser
+│   ├── test-ai.js                 # AI engine test without hardware
+│   └── cloudFunction.js           # optional Firebase Cloud Function ingestion
+├── src/                           # React dashboard
+│   └── components/visualizers/AiRiskPanel.jsx
+└── README.md
+```
 
 ---
 
-## 🔒 Security & Safe Publication Guidelines
+## Team Project X (Vivekananda Global University)
 
-- **Protected Secrets**: Never commit real `.env` files or Firebase `serviceAccountKey.json` files to Git. The repository includes an exhaustive [`.gitignore`](./.gitignore) file.
-- **Sanitized Placeholders**: All sensitive strings (Wi-Fi passwords, private server IPs, auth tokens) in public files use standard placeholders (`YOUR_WIFI_SSID`, `YOUR_DEVICE_SECRET_KEY`).
-- **Local Working Backups**: If you maintain private network credentials for local hardware testing, keep them in local unversioned files (e.g. `*_local.ino`).
-
----
-
-## 👥 Team & Contributions
-
-- **Lead Hardware & Firmware Engineer**: Mohd Uvais (*Prototype assembly, pinout mapping, sensor calibration*)
-- **Software & Full-Stack Architect**: ANVESHAK Development Team
-- **Contributors**: Open for community contributions via GitHub Pull Requests.
+| Member | NIAT ID | Role |
+| --- | --- | --- |
+| **Jatin Chandolia** (Team Leader) | N25J01A0094 | Hardware: circuit, sensors, LoRa, wiring and helmet build |
+| **Mohd Uvais** | N25J01A0374 | Frontend: live dashboard, alerts and AI risk display |
+| **Sahil Tilani** | N25J01A0352 | Presentation, documentation and testing support |
 
 ---
 
-## 🔮 Future Improvements
+## Safety Disclaimer
 
-1. **Dedicated LoRa Base Station**: Implementation of an ESP32 LoRa-to-MQTT receiver gateway for remote field deployments beyond Wi-Fi range.
-2. **Predictive Gas Dispersion Modelling**: Integration of ambient temperature and humidity compensation algorithms for the MQ-2 sensor.
-3. **PWA Offline Mode**: Progressive Web App service-worker caching for intermittent internet connectivity in underground facilities.
+> **ANVESHAK is a student prototype.** It is not a certified life-safety device and has not been evaluated under ATEX, IECEx or mining safety standards. The MQ-series sensors are low-cost and need calibration against reference instruments. Do not use it as a primary safety device in real hazardous environments.
 
----
+## License
 
-## ⚠️ Safety Disclaimer
-
-> [!WARNING]
-> **ANVESHAK IS AN ACADEMIC / INDUSTRIAL PROTOTYPE AND RESEARCH DEMONSTRATOR.**
->
-> It is **NOT** a certified life-safety device and has not been evaluated under ATEX, IECEx, UL 2075, or EN 50291 industrial safety standards. It must **not** be used as a primary life-safety alarm in hazardous, combustible, or oxygen-deficient environments. Always use certified, commercially approved safety instrumentation for hazardous operations.
-
----
-
-## 📄 License
-
-This project is licensed under the **MIT License** — see the [LICENSE](./LICENSE) file for details.
+MIT — see [LICENSE](./LICENSE).

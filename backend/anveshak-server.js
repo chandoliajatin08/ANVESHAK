@@ -1,9 +1,12 @@
 /**
  * ============================================================================
- * ANVESHAK Telemetry Ingestion Microservice
- * Server-Side Firebase Admin SDK Ingestion Endpoint
- * Target RTDB: https://anveshak-live-monitor-default-rtdb.asia-southeast1.firebasedatabase.app
- * Target Node: /devices/ANVESHAK-ESP32-01/latest
+ * ANVESHAK Backend Server  (backend/anveshak-server.js)
+ * ============================================================================
+ * - Reads the LoRa gateway (or the helmet directly) over USB serial
+ * - Accepts Wi-Fi HTTP packets on POST /api/ingest (optional)
+ * - Runs the AI risk engine (ai-engine.js) on every packet
+ * - Streams live data to the React dashboard over Server-Sent Events
+ * - Optionally mirrors data to Firebase Realtime Database
  * ============================================================================
  */
 
@@ -16,28 +19,34 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const DEVICE_KEY = process.env.DEVICE_KEY || 'anveshak_sec_key_esp32_01';
-const DATABASE_URL =
-  process.env.FIREBASE_DATABASE_URL ||
-  'https://anveshak-live-monitor-default-rtdb.asia-southeast1.firebasedatabase.app';
+const DEVICE_KEY = process.env.DEVICE_KEY || null;            // if set, HTTP packets must send this key
+const DATABASE_URL = process.env.FIREBASE_DATABASE_URL || null;
+const SERIAL_PORT = process.env.SERIAL_PORT || null;           // e.g. COM14 or /dev/ttyUSB0 (auto-detect if empty)
+const SERIAL_BAUD = Number(process.env.SERIAL_BAUD || 115200);
 
 import fs from 'fs';
 import path from 'path';
 import { SerialPort } from 'serialport';
 import { ReadlineParser } from '@serialport/parser-readline';
+import { analysePacket } from './ai-engine.js';
+import { parseLoraLine, LORA_PREFIX } from './lora-parser.js';
 
 // Initialize Firebase Admin SDK
 // 1. Using serviceAccountKey.json if present in backend/
 // 2. Or using FIREBASE_SERVICE_ACCOUNT_KEY environment variable (JSON string)
 // 3. Or using Google Application Default Credentials
+let firebaseEnabled = false;
 try {
   const localKeyPath = path.resolve('serviceAccountKey.json');
-  if (fs.existsSync(localKeyPath)) {
+  if (!DATABASE_URL) {
+    console.log('[FIREBASE] Disabled (local mode). Set FIREBASE_DATABASE_URL in .env to enable cloud sync.');
+  } else if (fs.existsSync(localKeyPath)) {
     const serviceAccount = JSON.parse(fs.readFileSync(localKeyPath, 'utf8'));
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
       databaseURL: DATABASE_URL,
     });
+    firebaseEnabled = true;
     console.log('[FIREBASE ADMIN] Initialized with local serviceAccountKey.json');
   } else if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
@@ -45,15 +54,12 @@ try {
       credential: admin.credential.cert(serviceAccount),
       databaseURL: DATABASE_URL,
     });
+    firebaseEnabled = true;
     console.log('[FIREBASE ADMIN] Initialized with FIREBASE_SERVICE_ACCOUNT_KEY env');
   } else {
-    // Falls back to Google Application Default Credentials or default app
-    admin.initializeApp({
-      databaseURL: DATABASE_URL,
-    });
-    console.log('[FIREBASE ADMIN] Initialized with default credentials/environment');
+    console.log('[FIREBASE] Disabled: no serviceAccountKey.json or FIREBASE_SERVICE_ACCOUNT_KEY found.');
   }
-  console.log('[FIREBASE ADMIN] Target RTDB:', DATABASE_URL);
+  if (firebaseEnabled) console.log('[FIREBASE ADMIN] Target RTDB:', DATABASE_URL);
 } catch (e) {
   console.error('[FIREBASE ADMIN INIT ERROR]', e.message);
   console.info('Tip: Place your serviceAccountKey.json in the backend/ folder or set FIREBASE_SERVICE_ACCOUNT_KEY in .env');
@@ -75,7 +81,7 @@ app.get('/', (req, res) => {
     <html lang="en">
     <head>
       <meta charset="UTF-8">
-      <title>ANVESHAK Backend Service</title>
+      <title>ANVESHAK Backend Server</title>
       <style>
         body { font-family: system-ui, sans-serif; background: #0b0f17; color: #f1f5f9; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
         .card { background: #151d2c; border: 1px solid #1e293b; padding: 2.5rem; border-radius: 1rem; box-shadow: 0 10px 25px rgba(0,0,0,0.5); max-width: 520px; text-align: center; }
@@ -90,8 +96,8 @@ app.get('/', (req, res) => {
     <body>
       <div class="card">
         <span class="badge">● Backend Online</span>
-        <h1>ANVESHAK API Microservice</h1>
-        <p>This is the backend ingestion service for ESP32 telemetry. To view the user interface dashboard, click the button below:</p>
+        <h1>ANVESHAK Backend Server</h1>
+        <p>Receives helmet telemetry (LoRa gateway, USB or Wi-Fi), runs the AI risk engine and streams it to the dashboard.</p>
         <a class="btn" href="http://localhost:5173" target="_self">Go to Frontend Dashboard (Port 5173)</a>
         <div class="endpoints">
           <div>GET  /health      - System Health Check</div>
@@ -109,8 +115,9 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ONLINE',
-    service: 'ANVESHAK Ingestion Service',
-    databaseURL: DATABASE_URL,
+    service: 'ANVESHAK Backend Server',
+    firebaseEnabled,
+    serialPort: activeSerialPort?.path || null,
     hasTelemetry: latestTelemetryPacket !== null,
     connectedClients: sseClients.size,
     timestamp: new Date().toISOString(),
@@ -158,6 +165,39 @@ app.get('/api/history', (req, res) => {
 });
 
 /**
+ * LoRa link information for the dashboard.
+ * "status" is true only when this packet actually arrived over LoRa.
+ * Packet loss is counted from gaps in the LoRa sequence numbers.
+ */
+const loraLinkStats = new Map();
+function buildLoraInfo(deviceId, payload, source) {
+  const viaLora = source === 'lora';
+  let stats = loraLinkStats.get(deviceId);
+  if (!stats) {
+    stats = { lastSeq: null, received: 0, missed: 0, lastAt: null };
+    loraLinkStats.set(deviceId, stats);
+  }
+  if (viaLora && payload.seq !== undefined && payload.seq !== null) {
+    const s = Number(payload.seq);
+    if (stats.lastSeq !== null && s > stats.lastSeq + 1) stats.missed += s - stats.lastSeq - 1;
+    if (stats.lastSeq !== null && s < stats.lastSeq) { stats.received = 0; stats.missed = 0; } // helmet restarted
+    stats.lastSeq = s;
+    stats.received += 1;
+    stats.lastAt = Date.now();
+  }
+  const total = stats.received + stats.missed;
+  return {
+    status: viaLora,                                           // link active for this packet
+    moduleReady: Boolean(payload.lora?.moduleReady ?? payload.lora?.status ?? false),
+    rssi: viaLora ? payload.lora?.rssi ?? null : null,
+    snr: viaLora ? payload.lora?.snr ?? null : null,
+    packetsReceived: stats.received,
+    packetLossPct: total > 0 ? Number(((stats.missed / total) * 100).toFixed(1)) : null,
+    lastLoraPacketAt: stats.lastAt ? new Date(stats.lastAt).toISOString() : null,
+  };
+}
+
+/**
  * Shared Real-time Telemetry Ingestion Engine
  * Handles packets from either HTTP POST or USB Serial Bridge
  */
@@ -171,9 +211,11 @@ function processTelemetry(payload, sourceOverride = 'hardware') {
     ? Number(payload.mq2.rawAdc)
     : (payload.gas_adc !== undefined ? Number(payload.gas_adc) : null);
 
-  const ppm = payload.mq2?.ppm !== undefined && payload.mq2?.ppm !== null && !isNaN(Number(payload.mq2.ppm))
-    ? Number(payload.mq2.ppm)
-    : null;
+  const toNum = (v) => (v !== undefined && v !== null && !isNaN(Number(v)) ? Number(v) : null);
+  const toPpm = (v) => { const n = toNum(v); return n === null || n < 0 ? null : n; };   // firmware sends -1 when uncalibrated
+  const ppm = toPpm(payload.mq2?.ppm);
+  const mq4Raw = toNum(payload.mq4?.rawAdc);
+  const mq4Ppm = toPpm(payload.mq4?.ppm);
 
   const voltage = payload.mq2?.voltage !== undefined && payload.mq2?.voltage !== null && !isNaN(Number(payload.mq2.voltage))
     ? Number(payload.mq2.voltage)
@@ -234,10 +276,18 @@ function processTelemetry(payload, sourceOverride = 'hardware') {
       chipTemp: payload.esp32?.chipTemp !== undefined ? Number(payload.esp32.chipTemp) : null,
       uptimeSeconds: payload.esp32?.uptimeSeconds !== undefined ? Number(payload.esp32.uptimeSeconds) : (payload.uptime !== undefined ? Number(payload.uptime) : null),
     },
+    status: payload.status || null,                  // NORMAL / WARNING / DANGER / FALL / SOS (decided on the helmet)
     mq2: {
       rawAdc,
       ppm,
       voltage,
+      calibrated: Boolean(payload.mq2?.calibrated),
+    },
+    mq4: {
+      enabled: Boolean(payload.mq4?.enabled ?? mq4Raw !== null),
+      rawAdc: mq4Raw,
+      ppm: mq4Ppm,
+      calibrated: Boolean(payload.mq4?.calibrated),
     },
     mpu6050: {
       accel: { x: ax, y: ay, z: az },
@@ -246,18 +296,28 @@ function processTelemetry(payload, sourceOverride = 'hardware') {
       roll: roll !== null ? roll : 0,
       pitch: pitch !== null ? pitch : 0,
     },
-    lora: {
-      status: payload.lora?.status ?? payload.loraOK ?? true,
-    },
-    sosActive: Boolean(payload.sosActive || payload.alarmActive),
+    lora: buildLoraInfo(deviceId, payload, source),
+    sosActive: Boolean(payload.sosActive),            // real SOS button only (no longer copied from the gas alarm)
+    fallDetected: Boolean(payload.fallDetected),
+    gasAlarm: Boolean(payload.alarmActive),
+    gasLevel: payload.gasLevel !== undefined && payload.gasLevel !== null ? Number(payload.gasLevel) : null,
+    fallEvent: payload.fallEvent && payload.fallEvent.id ? payload.fallEvent : null,
   };
+
+  // AI risk engine: gas trend prediction, anomaly detection, fall confidence, risk score
+  try {
+    sanitizedPacket.ai = analysePacket(sanitizedPacket);
+  } catch (aiErr) {
+    console.warn('[AI ENGINE ERROR]', aiErr.message);
+    sanitizedPacket.ai = null;
+  }
 
   // 1. Store in Memory Cache
   if (!isSimulated) {
     lastHardwarePacketTimestamp = Date.now();
   }
   latestTelemetryPacket = sanitizedPacket;
-  console.log(`[HARDWARE PACKET via ${source.toUpperCase()}] Device: ${deviceId} | MQ-2 ADC: ${rawAdc} | Gyro: (${gx}, ${gy}, ${gz}) | Temp: ${tempC}°C | LoRa: ${sanitizedPacket.lora.status ? 'OK' : 'ERR'}`);
+  console.log(`[PACKET via ${source.toUpperCase()}] ${deviceId} | status ${sanitizedPacket.status ?? '-'} | MQ-2 ${rawAdc} | MQ-4 ${mq4Raw ?? '-'} | SOS ${sanitizedPacket.sosActive ? 'YES' : 'no'} | fall ${sanitizedPacket.fallDetected ? 'YES' : 'no'} | risk ${sanitizedPacket.ai?.riskScore ?? '-'} | LoRa link ${sanitizedPacket.lora.status ? 'ON' : 'off'}`);
 
   let gForce = null;
   if (ax !== null && ay !== null && az !== null) {
@@ -276,6 +336,12 @@ function processTelemetry(payload, sourceOverride = 'hardware') {
       gForce: gForce || 0,
     },
     sosActive: sanitizedPacket.sosActive,
+    fallDetected: sanitizedPacket.fallDetected,
+    status: sanitizedPacket.status,
+    mq4Adc: mq4Raw,
+    mq4Ppm,
+    riskScore: sanitizedPacket.ai?.riskScore ?? null,
+    source,
   };
   recentHistory.push(historyEntry);
   if (recentHistory.length > 100) recentHistory.shift();
@@ -292,7 +358,7 @@ function processTelemetry(payload, sourceOverride = 'hardware') {
 
   // 3. Asynchronous optional push to Firebase RTDB (Non-blocking)
   try {
-    if (admin.apps.length > 0) {
+    if (firebaseEnabled && admin.apps.length > 0) {
       const db = admin.database();
       db.ref(`devices/${deviceId}/latest`).set(sanitizedPacket).catch((err) => {
         console.warn('[FIREBASE RTDB WRITE SKIPPED]', err.message);
@@ -315,7 +381,7 @@ app.post('/api/ingest', async (req, res) => {
   const incomingKey = req.headers['x-device-key'];
 
   // 1. Device Authentication Check
-  if (incomingKey && incomingKey !== DEVICE_KEY) {
+  if (DEVICE_KEY && incomingKey !== DEVICE_KEY) {
     return res.status(401).json({
       error: 'Unauthorized: Invalid X-Device-Key header.',
     });
@@ -338,10 +404,11 @@ app.post('/api/ingest', async (req, res) => {
 });
 
 // ============================================================================
-// Auto-Reconnecting Direct USB Serial Port Ingestion (COM14 / Auto-Detect)
-// Supports both Hardware Text Stream & JSON Telemetry Streams
+// Auto-Reconnecting USB Serial Ingestion (SERIAL_PORT in .env, or auto-detect)
+// Accepts: LoRa gateway lines, helmet JSON lines, and the old text format
 // ============================================================================
 let activeSerialPort = null;
+let lastSerialError = null;
 let serialParser = null;
 
 // Multi-line hardware telemetry state buffer
@@ -355,14 +422,27 @@ const serialPacketBuffer = {
 
 async function initSerialMonitor() {
   try {
-    const ports = await SerialPort.list();
-    const espPort = ports.find(p => p.path === 'COM14') ||
+    // If SERIAL_PORT is set we use it directly; otherwise list the ports and auto-detect the ESP32
+    let ports = [];
+    if (!SERIAL_PORT) {
+      try {
+        ports = await SerialPort.list();
+      } catch (listErr) {
+        console.warn(`[USB SERIAL] Could not list serial ports (${listErr.message}). Set SERIAL_PORT in .env.`);
+      }
+    }
+    const espPort = (SERIAL_PORT && ports.find(p => p.path === SERIAL_PORT)) ||
       ports.find(p => {
         const desc = `${p.manufacturer || ''} ${p.friendlyName || ''}`.toLowerCase();
         return desc.includes('cp210') || desc.includes('ch340') || desc.includes('silicon') || desc.includes('usb');
       });
 
-    const targetPath = espPort ? espPort.path : (ports.length > 0 ? ports[0].path : 'COM14');
+    const targetPath = SERIAL_PORT || (espPort ? espPort.path : (ports.length > 0 ? ports[0].path : null));
+    if (!targetPath) {
+      console.log('[USB SERIAL] No serial port found. Plug in the gateway (or helmet) - retrying in 3 s.');
+      setTimeout(initSerialMonitor, 3000);
+      return;
+    }
 
     if (activeSerialPort && activeSerialPort.isOpen) {
       return; // Already streaming
@@ -370,7 +450,7 @@ async function initSerialMonitor() {
 
     activeSerialPort = new SerialPort({
       path: targetPath,
-      baudRate: 115200,
+      baudRate: SERIAL_BAUD,
       autoOpen: false,
     });
 
@@ -379,6 +459,19 @@ async function initSerialMonitor() {
     serialParser.on('data', (rawLine) => {
       const line = rawLine.toString().trim();
       if (!line) return;
+
+      // -------------------------------------------------------------
+      // Format 0: LoRa gateway  [ANVESHAK_LORA]ANV,...|RSSI|SNR
+      // -------------------------------------------------------------
+      if (line.startsWith(LORA_PREFIX)) {
+        const parsed = parseLoraLine(line);
+        if (parsed) processTelemetry(parsed, 'lora');
+        return;
+      }
+      if (line.startsWith('[GATEWAY]')) {
+        console.log(line);
+        return;
+      }
 
       // -------------------------------------------------------------
       // Format 1: Text Telemetry Format (Current Hardware Output)
@@ -444,12 +537,12 @@ async function initSerialMonitor() {
           },
           esp32: {
             isOnline: true,
-            ipAddress: 'USB-COM14',
+            ipAddress: `USB-${activeSerialPort?.path || 'serial'}`,
             uptimeSeconds: Math.floor(process.uptime()),
           },
-          lora: { status: false },
+          lora: { moduleReady: false },
           alarmActive: rawAdc >= 1000,
-          sosActive: rawAdc >= 1000,
+          sosActive: false,
         }, 'usb-hardware');
         return;
       }
@@ -481,10 +574,15 @@ async function initSerialMonitor() {
 
     activeSerialPort.open((err) => {
       if (err) {
+        if (lastSerialError !== err.message) {
+          console.warn(`[USB SERIAL] Could not open ${targetPath}: ${err.message} (retrying every 3 s)`);
+          lastSerialError = err.message;
+        }
         activeSerialPort = null;
         setTimeout(initSerialMonitor, 3000);
       } else {
-        console.log(`[USB SERIAL BRIDGE] Connected to ESP32 on ${targetPath} (115200 baud). Live telemetry active!`);
+        lastSerialError = null;
+        console.log(`[USB SERIAL] Connected on ${targetPath} (${SERIAL_BAUD} baud). Waiting for helmet / gateway data...`);
       }
     });
 
@@ -498,13 +596,14 @@ async function initSerialMonitor() {
       setTimeout(initSerialMonitor, 3000);
     });
   } catch (err) {
+    console.warn(`[USB SERIAL] ${err.message} (retrying in 5 s)`);
     setTimeout(initSerialMonitor, 5000);
   }
 }
 
 app.listen(PORT, () => {
-  console.log(`[ANVESHAK INGESTION SERVER] Running on port ${PORT}`);
-  console.log(`[TARGET RTDB] ${DATABASE_URL}`);
+  console.log(`[ANVESHAK BACKEND] Running on http://localhost:${PORT}`);
+  console.log(`[FIREBASE] ${firebaseEnabled ? DATABASE_URL : 'disabled (local mode)'}`);
   console.log(`[HTTP INGESTION] POST http://localhost:${PORT}/api/ingest`);
   initSerialMonitor();
 });
