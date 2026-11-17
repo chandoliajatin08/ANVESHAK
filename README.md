@@ -77,6 +77,8 @@ graph TD
 
 ## 🔌 Hardware Pinout Matrix
 
+> **Two-board setup (helmet + LoRa gateway), wiring, antenna and 72-hour history: see [`hardware/README.md`](./hardware/README.md).** The table below is for the old single-board firmware.
+
 Based on the actual verified firmware implementation in [`hardware/anveshak_esp32_firmware/anveshak_esp32_firmware.ino`](./hardware/anveshak_esp32_firmware/anveshak_esp32_firmware.ino):
 
 | Peripheral | ESP32 Pin | Interface / Bus | Signal Description |

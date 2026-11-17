@@ -24,6 +24,10 @@ import {
   set,
   get,
   serverTimestamp,
+  query,
+  orderByChild,
+  startAt,
+  endAt,
 } from 'firebase/database';
 
 const STORAGE_KEY = 'anveshak_firebase_config';
@@ -332,6 +336,10 @@ export {
   set,
   get,
   serverTimestamp,
+  query,
+  orderByChild,
+  startAt,
+  endAt,
   signInWithEmailAndPassword,
   signOut,
   onAuthStateChanged,

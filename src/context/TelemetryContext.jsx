@@ -63,6 +63,8 @@ export const parseHardwarePacket = (val) => {
       rawAdc: rawAdc !== null ? Number(rawAdc) : null,
       voltage: voltage !== null ? Number(voltage) : null,
       ppm: val.mq2?.ppm !== undefined && val.mq2?.ppm !== null ? Number(val.mq2.ppm) : null,
+      baseline: val.mq2?.baseline ?? null,
+      alarm: val.mq2?.alarm ?? null, // 0/1/2 from helmet (uncalibrated sensor, baseline-relative)
     },
     mpu6050: {
       accel: {
@@ -82,7 +84,8 @@ export const parseHardwarePacket = (val) => {
     lora: {
       status: val.lora?.status ?? val.loraOK ?? true,
     },
-    sosActive: Boolean(val.sosActive ?? val.alarmActive ?? val.sos),
+    fallDetected: Boolean(val.fallDetected),
+    sosActive: Boolean(val.sosActive ?? val.sos),
   };
 };
 
@@ -160,9 +163,12 @@ export const TelemetryProvider = ({ children }) => {
     }
 
     // 2. Gas threshold check
+    // Helmet sends its own alarm level (baseline-relative); use it so the dashboard and
+    // the buzzer always agree. ADC thresholds are only the fallback for old firmware.
     const adc = packet.mq2?.rawAdc;
+    const level = packet.mq2?.alarm ?? (adc == null ? 0 : adc >= thresholds.gasCritical ? 2 : adc >= thresholds.gasWarning ? 1 : 0);
     if (adc !== null && adc !== undefined) {
-      if (adc >= thresholds.gasCritical) {
+      if (level === 2) {
         newAlerts.push({
           id: `gas_crit_${Date.now()}`,
           type: 'GAS_CRITICAL',
@@ -174,7 +180,7 @@ export const TelemetryProvider = ({ children }) => {
           sensor: 'MQ-2',
         });
         soundEffects.playCriticalAlarm();
-      } else if (adc >= thresholds.gasWarning) {
+      } else if (level === 1) {
         newAlerts.push({
           id: `gas_warn_${Date.now()}`,
           type: 'GAS_WARNING',
@@ -193,12 +199,12 @@ export const TelemetryProvider = ({ children }) => {
     const { accel, roll, pitch } = packet.mpu6050;
     if (accel && accel.x !== null) {
       const gForce = calculateGForce(accel.x, accel.y, accel.z);
-      if (gForce >= thresholds.fallGForce) {
+      if (packet.fallDetected || gForce >= thresholds.fallGForce) {
         newAlerts.push({
           id: `shock_${Date.now()}`,
           type: 'HIGH_G_SHOCK',
           title: 'HIGH G-FORCE IMPACT SHOCK',
-          message: `MPU-6050 registered shock acceleration of ${gForce.toFixed(2)}g.`,
+          message: packet.fallDetected ? 'Helmet detected a fall / impact.' : `MPU-6050 registered shock acceleration of ${gForce.toFixed(2)}g.`,
           timestamp,
           severity: 'critical',
           acknowledged: false,

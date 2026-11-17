@@ -68,6 +68,14 @@ const recentHistory = [];
 const sseClients = new Set();
 let lastHardwarePacketTimestamp = 0;
 
+// History / alert bookkeeping (single helmet; make these per-device maps if you add more helmets)
+const HISTORY_INTERVAL_MS = 15000;
+let lastHistoryWrite = 0;
+let windowMaxGas = null;
+let windowMaxG = null;
+let lastSeq = null;
+let prevState = { sos: false, fall: false, gas: 0 };
+
 // Root Landing Endpoint
 app.get('/', (req, res) => {
   res.send(`
@@ -218,11 +226,19 @@ function processTelemetry(payload, sourceOverride = 'hardware') {
   const isSimulated = Boolean(payload.isSimulated || payload.isTestPacket || payload.source === 'test-packet');
   const source = isSimulated ? 'test-packet' : (sourceOverride || payload.source || 'hardware');
 
+  const seq = payload.seq !== undefined && payload.seq !== null ? Number(payload.seq) : null;
+  // Same packet can arrive twice (gateway on USB and Wi-Fi at once): keep the first.
+  if (seq !== null && seq === lastSeq && latestTelemetryPacket) return latestTelemetryPacket;
+  lastSeq = seq;
+
+  const gasAlarm = payload.mq2?.alarm !== undefined && payload.mq2?.alarm !== null ? Number(payload.mq2.alarm) : null;
+
   const sanitizedPacket = {
-    timestamp: payload.timestamp || now,
+    // Server clock is the single source of truth: helmet/gateway have no real-time clock.
+    timestamp: now,
     heartbeat: now,
     device: deviceId,
-    seq: payload.seq !== undefined && payload.seq !== null ? Number(payload.seq) : null,
+    seq,
     isSimulated,
     source,
     esp32: {
@@ -238,18 +254,21 @@ function processTelemetry(payload, sourceOverride = 'hardware') {
       rawAdc,
       ppm,
       voltage,
+      baseline: payload.mq2?.baseline !== undefined && payload.mq2?.baseline !== null ? Number(payload.mq2.baseline) : null,
+      alarm: gasAlarm,
     },
     mpu6050: {
       accel: { x: ax, y: ay, z: az },
       gyro: { x: gx, y: gy, z: gz },
       tempC,
-      roll: roll !== null ? roll : 0,
-      pitch: pitch !== null ? pitch : 0,
+      roll,
+      pitch,
     },
     lora: {
       status: payload.lora?.status ?? payload.loraOK ?? true,
     },
-    sosActive: Boolean(payload.sosActive || payload.alarmActive),
+    fallDetected: Boolean(payload.fallDetected),
+    sosActive: Boolean(payload.sosActive),
   };
 
   // 1. Store in Memory Cache
@@ -264,21 +283,44 @@ function processTelemetry(payload, sourceOverride = 'hardware') {
     gForce = Number(Math.sqrt(ax * ax + ay * ay + az * az).toFixed(2));
   }
 
-  const historyEntry = {
-    timestamp: sanitizedPacket.timestamp,
-    gasAdc: rawAdc,
-    ppm,
-    tempC,
-    gForce: gForce || 0,
-    mq2: sanitizedPacket.mq2,
-    mpu6050: {
-      ...sanitizedPacket.mpu6050,
-      gForce: gForce || 0,
-    },
-    sosActive: sanitizedPacket.sosActive,
-  };
-  recentHistory.push(historyEntry);
-  if (recentHistory.length > 100) recentHistory.shift();
+  // History: one row per HISTORY_INTERVAL_MS (72 h = ~17k rows), or immediately on an alarm.
+  // Gas and g-force keep the window MAXIMUM so short spikes are never lost.
+  if (rawAdc !== null) windowMaxGas = Math.max(windowMaxGas ?? rawAdc, rawAdc);
+  if (gForce !== null) windowMaxG = Math.max(windowMaxG ?? gForce, gForce);
+  const urgent = sanitizedPacket.sosActive || sanitizedPacket.fallDetected || (gasAlarm ?? 0) > 0;
+  let historyEntry = null;
+  if (urgent || Date.now() - lastHistoryWrite >= HISTORY_INTERVAL_MS) {
+    historyEntry = {
+      timestamp: now,
+      gasAdc: windowMaxGas,
+      gasAlarm,
+      tempC,
+      gForce: windowMaxG,
+      ax, ay, az, gx, gy, gz,
+      sosActive: sanitizedPacket.sosActive,
+      fallDetected: sanitizedPacket.fallDetected,
+    };
+    lastHistoryWrite = Date.now();
+    windowMaxGas = null;
+    windowMaxG = null;
+    recentHistory.push(historyEntry);
+    if (recentHistory.length > 100) recentHistory.shift();
+  }
+
+  // Alerts: write one record when a condition STARTS (not every second while it lasts).
+  const newAlerts = [];
+  if (sanitizedPacket.sosActive && !prevState.sos) {
+    newAlerts.push({ type: 'SOS_EVENT', severity: 'critical', sensor: 'SOS_BUTTON', title: 'EMERGENCY SOS TRIGGERED', message: 'SOS button pressed on helmet.' });
+  }
+  if (sanitizedPacket.fallDetected && !prevState.fall) {
+    newAlerts.push({ type: 'HIGH_G_SHOCK', severity: 'critical', sensor: 'MPU-6050', title: 'FALL / IMPACT DETECTED', message: `Impact detected on helmet (${gForce ?? '?'} g now).` });
+  }
+  if ((gasAlarm ?? 0) > prevState.gas) {
+    newAlerts.push(gasAlarm >= 2
+      ? { type: 'GAS_CRITICAL', severity: 'critical', sensor: 'MQ-2', title: 'DANGEROUS GAS / SMOKE LEAK', message: `Gas ADC ${rawAdc} (clean-air baseline ${sanitizedPacket.mq2.baseline}).` }
+      : { type: 'GAS_WARNING', severity: 'warning', sensor: 'MQ-2', title: 'ELEVATED GAS READING', message: `Gas ADC ${rawAdc} (clean-air baseline ${sanitizedPacket.mq2.baseline}).` });
+  }
+  prevState = { sos: sanitizedPacket.sosActive, fall: sanitizedPacket.fallDetected, gas: gasAlarm ?? 0 };
 
   // 2. Real-time broadcast to connected web UI clients (Zero Latency)
   const sseMsg = `data: ${JSON.stringify(sanitizedPacket)}\n\n`;
@@ -297,7 +339,14 @@ function processTelemetry(payload, sourceOverride = 'hardware') {
       db.ref(`devices/${deviceId}/latest`).set(sanitizedPacket).catch((err) => {
         console.warn('[FIREBASE RTDB WRITE SKIPPED]', err.message);
       });
-      db.ref(`devices/${deviceId}/history`).push(historyEntry).catch(() => {});
+      if (historyEntry) {
+        db.ref(`devices/${deviceId}/history`).push(historyEntry).catch((err) => {
+          console.warn('[FIREBASE HISTORY WRITE FAILED]', err.message);
+        });
+      }
+      for (const alert of newAlerts) {
+        db.ref(`devices/${deviceId}/alerts`).push({ ...alert, timestamp: now, acknowledged: false }).catch(() => {});
+      }
     }
   } catch (fbErr) {
     console.warn('[FIREBASE SKIP]', fbErr.message);
@@ -344,14 +393,6 @@ app.post('/api/ingest', async (req, res) => {
 let activeSerialPort = null;
 let serialParser = null;
 
-// Multi-line hardware telemetry state buffer
-const serialPacketBuffer = {
-  rawAdc: null,
-  ax: null, ay: null, az: null,
-  gx: null, gy: null, gz: null,
-  tempC: null,
-  lastUpdated: 0,
-};
 
 async function initSerialMonitor() {
   try {
@@ -379,80 +420,6 @@ async function initSerialMonitor() {
     serialParser.on('data', (rawLine) => {
       const line = rawLine.toString().trim();
       if (!line) return;
-
-      // -------------------------------------------------------------
-      // Format 1: Text Telemetry Format (Current Hardware Output)
-      // Example:
-      // MQ2 ADC: 813
-      // Accel(g): X=0.04 Y=0.04 Z=1.05
-      // Gyro(deg/s): X=-5.1 Y=1.4 Z=1.1
-      // MPU Temperature: 47.40 C
-      // -------------------------------------------------------------
-      const mqMatch = line.match(/MQ2\s*(?:ADC)?:?\s*(\d+)/i);
-      if (mqMatch) {
-        serialPacketBuffer.rawAdc = Number(mqMatch[1]);
-        serialPacketBuffer.lastUpdated = Date.now();
-      }
-
-      const accelMatch = line.match(/Accel\(g\):\s*X=([-\d.]+)\s+Y=([-\d.]+)\s+Z=([-\d.]+)/i);
-      if (accelMatch) {
-        serialPacketBuffer.ax = Number(accelMatch[1]);
-        serialPacketBuffer.ay = Number(accelMatch[2]);
-        serialPacketBuffer.az = Number(accelMatch[3]);
-        serialPacketBuffer.lastUpdated = Date.now();
-      }
-
-      const gyroMatch = line.match(/Gyro\(deg\/s\):\s*X=([-\d.]+)\s+Y=([-\d.]+)\s+Z=([-\d.]+)/i);
-      if (gyroMatch) {
-        serialPacketBuffer.gx = Number(gyroMatch[1]);
-        serialPacketBuffer.gy = Number(gyroMatch[2]);
-        serialPacketBuffer.gz = Number(gyroMatch[3]);
-        serialPacketBuffer.lastUpdated = Date.now();
-      }
-
-      const tempMatch = line.match(/(?:MPU\s*)?Temperature:\s*([-\d.]+)/i);
-      if (tempMatch) {
-        serialPacketBuffer.tempC = Number(tempMatch[1]);
-        serialPacketBuffer.lastUpdated = Date.now();
-
-        // End of packet block: Dispatch telemetry to UI
-        const rawAdc = serialPacketBuffer.rawAdc !== null ? serialPacketBuffer.rawAdc : 0;
-        const ax = serialPacketBuffer.ax ?? 0;
-        const ay = serialPacketBuffer.ay ?? 0;
-        const az = serialPacketBuffer.az ?? 1.0;
-        const gx = serialPacketBuffer.gx ?? 0;
-        const gy = serialPacketBuffer.gy ?? 0;
-        const gz = serialPacketBuffer.gz ?? 0;
-        const tempC = serialPacketBuffer.tempC ?? 30.0;
-
-        const roll = Math.round(Math.atan2(-ax, az) * (180 / Math.PI));
-        const pitch = Math.round(Math.atan2(ay, Math.sqrt(ax * ax + az * az)) * (180 / Math.PI));
-
-        processTelemetry({
-          device: 'ANVESHAK-ESP32-01',
-          source: 'usb-hardware',
-          mq2: {
-            rawAdc,
-            voltage: Number(((rawAdc / 4095) * 3.3).toFixed(2)),
-          },
-          mpu6050: {
-            accel: { x: ax, y: ay, z: az },
-            gyro: { x: gx, y: gy, z: gz },
-            tempC,
-            roll,
-            pitch,
-          },
-          esp32: {
-            isOnline: true,
-            ipAddress: 'USB-COM14',
-            uptimeSeconds: Math.floor(process.uptime()),
-          },
-          lora: { status: false },
-          alarmActive: rawAdc >= 1000,
-          sosActive: rawAdc >= 1000,
-        }, 'usb-hardware');
-        return;
-      }
 
       // -------------------------------------------------------------
       // Format 2: Tagged [ANVESHAK_DATA]{...}

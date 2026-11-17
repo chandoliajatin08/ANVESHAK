@@ -27,6 +27,10 @@ import {
   ref,
   onValue,
   off,
+  query,
+  orderByChild,
+  startAt,
+  endAt,
 } from '../services/firebase';
 import { useAuth } from '../context/AuthContext';
 import {
@@ -72,23 +76,32 @@ const normalizeHistoryItem = (item, id) => {
         y: gy !== null && !isNaN(Number(gy)) ? Number(gy) : null,
         z: gz !== null && !isNaN(Number(gz)) ? Number(gz) : null,
       },
-      gForce: gForce !== null && !isNaN(Number(gForce)) ? Number(Number(gForce).toFixed(2)) : 0,
+      gForce: gForce !== null && !isNaN(Number(gForce)) ? Number(Number(gForce).toFixed(2)) : null,
       tempC,
     },
-    alert: item.alert || (item.sosActive ? { type: 'SOS_TRIGGER', message: 'Physical Emergency SOS engaged' } : null),
+    alert: item.alert
+      || (item.sosActive ? { type: 'SOS_TRIGGER', message: 'Physical Emergency SOS engaged' }
+      : item.fallDetected ? { type: 'FALL', message: 'Fall / impact detected' }
+      : item.gasAlarm >= 2 ? { type: 'GAS_CRITICAL', message: 'Dangerous gas level' }
+      : item.gasAlarm === 1 ? { type: 'GAS_WARNING', message: 'Elevated gas level' }
+      : null),
   };
 };
+
+// <input type="datetime-local"> works in LOCAL time, so its value must be local too (not toISOString()).
+const toLocalInput = (ms) => {
+  const d = new Date(ms);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+};
+const PRESET_HOURS = { '1h': 1, '6h': 6, '24h': 24, '72h': 72, '7d': 168 };
+const MAX_CHART_POINTS = 1500;
 
 export const HistoricalData = () => {
   const { firebaseUser, authReady } = useAuth();
   // Date range presets
-  const [preset, setPreset] = useState('24h'); // '1h' | '6h' | '24h' | '7d' | 'custom'
-  const [startDate, setStartDate] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 1);
-    return d.toISOString().slice(0, 16);
-  });
-  const [endDate, setEndDate] = useState(() => new Date().toISOString().slice(0, 16));
+  const [preset, setPreset] = useState('72h'); // '1h' | '6h' | '24h' | '72h' | '7d' | 'custom'
+  const [startDate, setStartDate] = useState(() => toLocalInput(Date.now() - 72 * 3600000));
+  const [endDate, setEndDate] = useState(() => toLocalInput(Date.now()));
 
   const [activeMetric, setActiveMetric] = useState('gas'); // 'gas' | 'accel' | 'gyro' | 'temp'
   const [searchQuery, setSearchQuery] = useState('');
@@ -98,22 +111,9 @@ export const HistoricalData = () => {
   // Handle Preset Change
   const handlePresetSelect = (p) => {
     setPreset(p);
-    const now = new Date();
-    let start = new Date();
-
-    if (p === '1h') {
-      start.setHours(now.getHours() - 1);
-    } else if (p === '6h') {
-      start.setHours(now.getHours() - 6);
-    } else if (p === '24h') {
-      start.setDate(now.getDate() - 1);
-    } else if (p === '7d') {
-      start.setDate(now.getDate() - 7);
-    }
-
     if (p !== 'custom') {
-      setStartDate(start.toISOString().slice(0, 16));
-      setEndDate(now.toISOString().slice(0, 16));
+      setStartDate(toLocalInput(Date.now() - PRESET_HOURS[p] * 3600000));
+      setEndDate(toLocalInput(Date.now()));
     }
   };
 
@@ -136,27 +136,22 @@ export const HistoricalData = () => {
     }
 
     setHistoryLoading(true);
-    const historyRef = ref(fb.db, 'devices/ANVESHAK-ESP32-01/history');
+    // Only download the selected range (needs ".indexOn": ["timestamp"] in database.rules.json).
+    // Presets have no end bound so new rows keep streaming in live.
+    const constraints = [orderByChild('timestamp'), startAt(new Date(startDate).toISOString())];
+    if (preset === 'custom') constraints.push(endAt(new Date(new Date(endDate).getTime() + 59999).toISOString()));
+    const historyRef = query(ref(fb.db, 'devices/ANVESHAK-ESP32-01/history'), ...constraints);
 
     const unsubscribe = onValue(
       historyRef,
       (snapshot) => {
         setHistoryLoading(false);
-        const data = snapshot.val();
-        if (data && typeof data === 'object') {
-          const list = Object.keys(data)
-            .map((key) => normalizeHistoryItem(data[key], key))
-            .filter((item) => {
-              if (!item || !item.timestamp) return false;
-              const t = new Date(item.timestamp).getTime();
-              const s = new Date(startDate).getTime();
-              const e = new Date(endDate).getTime();
-              return t >= s && t <= e;
-            });
-          setFirebaseLogs(list);
-        } else {
-          setFirebaseLogs([]);
-        }
+        const list = [];
+        snapshot.forEach((child) => {  // forEach keeps time order; .val() would not
+          const item = normalizeHistoryItem(child.val(), child.key);
+          if (item && item.timestamp) list.push(item);
+        });
+        setFirebaseLogs(list);
       },
       (err) => {
         setHistoryLoading(false);
@@ -169,7 +164,7 @@ export const HistoricalData = () => {
       if (typeof unsubscribe === 'function') unsubscribe();
       off(historyRef);
     };
-  }, [startDate, endDate, authReady, firebaseUser]);
+  }, [startDate, endDate, preset, authReady, firebaseUser]);
 
   // Production hardware logs only - strictly no simulated fallbacks
   const logs = useMemo(() => {
@@ -222,20 +217,32 @@ export const HistoricalData = () => {
   }, [logs]);
 
   // Chart data
+  // 72 h is ~17k rows; charts get MAX_CHART_POINTS buckets. Gas and g-force use the
+  // bucket maximum so a spike is never hidden; other values use the last reading.
   const chartData = useMemo(() => {
-    return logs.map((log) => ({
-      time: formatDateTime(log.timestamp),
-      gasAdc: log.mq2?.rawAdc ?? null,
-      ppm: log.mq2?.ppm ?? null,
-      accelX: log.mpu6050?.accel?.x ?? null,
-      accelY: log.mpu6050?.accel?.y ?? null,
-      accelZ: log.mpu6050?.accel?.z ?? null,
-      gForce: log.mpu6050?.gForce ?? null,
-      gyroX: log.mpu6050?.gyro?.x ?? null,
-      gyroY: log.mpu6050?.gyro?.y ?? null,
-      gyroZ: log.mpu6050?.gyro?.z ?? null,
-      temp: log.mpu6050?.tempC ?? null,
-    }));
+    const step = Math.max(1, Math.ceil(logs.length / MAX_CHART_POINTS));
+    const bucketMax = (bucket, pick) => bucket.reduce((m, l) => {
+      const v = pick(l);
+      return typeof v === 'number' && (m === null || v > m) ? v : m;
+    }, null);
+    const buckets = [];
+    for (let i = 0; i < logs.length; i += step) buckets.push(logs.slice(i, i + step));
+    return buckets.map((bucket) => {
+      const log = bucket[bucket.length - 1];
+      return {
+        time: formatDateTime(log.timestamp),
+        gasAdc: bucketMax(bucket, (l) => l.mq2?.rawAdc),
+        ppm: log.mq2?.ppm ?? null,
+        accelX: log.mpu6050?.accel?.x ?? null,
+        accelY: log.mpu6050?.accel?.y ?? null,
+        accelZ: log.mpu6050?.accel?.z ?? null,
+        gForce: bucketMax(bucket, (l) => l.mpu6050?.gForce),
+        gyroX: log.mpu6050?.gyro?.x ?? null,
+        gyroY: log.mpu6050?.gyro?.y ?? null,
+        gyroZ: log.mpu6050?.gyro?.z ?? null,
+        temp: log.mpu6050?.tempC ?? null,
+      };
+    });
   }, [logs]);
 
   // Table filtering and pagination
@@ -337,6 +344,7 @@ export const HistoricalData = () => {
               { id: '1h', label: 'Last 1 Hour' },
               { id: '6h', label: 'Last 6 Hours' },
               { id: '24h', label: 'Last 24 Hours' },
+              { id: '72h', label: 'Last 72 Hours' },
               { id: '7d', label: 'Last 7 Days' },
               { id: 'custom', label: 'Custom' },
             ].map((p) => (

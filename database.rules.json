@@ -3,7 +3,10 @@
     "devices": {
       "ANVESHAK-ESP32-01": {
         ".read": "auth != null",
-        ".write": "auth != null"
+        ".write": "auth != null",
+        "history": {
+          ".indexOn": ["timestamp"]
+        }
       }
     }
   }
