@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { soundEffects } from '../services/soundEffects';
 import {
   initFirebase,
@@ -59,10 +59,18 @@ export const parseHardwarePacket = (val) => {
       chipTemp: val.esp32?.chipTemp ?? null,
       uptimeSeconds: val.esp32?.uptimeSeconds ?? val.uptime ?? null,
     },
+    status: val.status || null,   // NORMAL / WARNING / DANGER / FALL / SOS, decided on the helmet
     mq2: {
       rawAdc: rawAdc !== null ? Number(rawAdc) : null,
       voltage: voltage !== null ? Number(voltage) : null,
-      ppm: val.mq2?.ppm !== undefined && val.mq2?.ppm !== null ? Number(val.mq2.ppm) : null,
+      ppm: val.mq2?.ppm !== undefined && val.mq2?.ppm !== null && Number(val.mq2.ppm) >= 0 ? Number(val.mq2.ppm) : null,
+      calibrated: Boolean(val.mq2?.calibrated),
+    },
+    mq4: {
+      enabled: Boolean(val.mq4?.enabled ?? (val.mq4?.rawAdc !== undefined && val.mq4?.rawAdc !== null)),
+      rawAdc: val.mq4?.rawAdc !== undefined && val.mq4?.rawAdc !== null ? Number(val.mq4.rawAdc) : null,
+      ppm: val.mq4?.ppm !== undefined && val.mq4?.ppm !== null && Number(val.mq4.ppm) >= 0 ? Number(val.mq4.ppm) : null,
+      calibrated: Boolean(val.mq4?.calibrated),
     },
     mpu6050: {
       accel: {
@@ -80,9 +88,21 @@ export const parseHardwarePacket = (val) => {
       pitch: Number(pitch),
     },
     lora: {
-      status: val.lora?.status ?? val.loraOK ?? true,
+      // true only when the packet really arrived over LoRa (never assumed)
+      status: Boolean(val.lora?.status ?? false),
+      moduleReady: Boolean(val.lora?.moduleReady ?? false),
+      rssi: val.lora?.rssi ?? null,
+      snr: val.lora?.snr ?? null,
+      packetsReceived: val.lora?.packetsReceived ?? null,
+      packetLossPct: val.lora?.packetLossPct ?? null,
     },
-    sosActive: Boolean(val.sosActive ?? val.alarmActive ?? val.sos),
+    // Real SOS button state only - no longer copied from the gas alarm
+    sosActive: Boolean(val.sosActive ?? val.sos ?? false),
+    fallDetected: Boolean(val.fallDetected),
+    gasAlarm: Boolean(val.gasAlarm ?? val.alarmActive),
+    gasLevel: val.gasLevel !== undefined && val.gasLevel !== null ? Number(val.gasLevel) : null, // 0 normal, 1 warning, 2 danger
+    fallEvent: val.fallEvent ?? null,
+    ai: val.ai ?? null,
   };
 };
 
@@ -105,6 +125,9 @@ export const TelemetryProvider = ({ children }) => {
 
   // Alert Log - loaded from Firebase RTDB and active alerts
   const [alerts, setAlerts] = useState([]);
+  // Time each alert type was last raised, so a continuing condition does not add a new alert every packet
+  const lastAlertAtRef = useRef({});
+  const ALERT_REPEAT_MS = 30000;
 
   // Live Firebase connection and device freshness state
   const [firebaseConnected, setFirebaseConnected] = useState(false);
@@ -155,37 +178,85 @@ export const TelemetryProvider = ({ children }) => {
         severity: 'critical',
         acknowledged: false,
         sensor: 'SOS_BUTTON',
+        sound: 'sos',
       });
-      soundEffects.playSosAlarm();
     }
 
-    // 2. Gas threshold check
-    const adc = packet.mq2?.rawAdc;
-    if (adc !== null && adc !== undefined) {
-      if (adc >= thresholds.gasCritical) {
+    // 1b. Fall detected on the helmet (free fall -> impact -> lying still)
+    if (packet.fallDetected) {
+      const conf = packet.ai?.fall?.confidence;
+      newAlerts.push({
+        id: `fall_${Date.now()}`,
+        type: 'FALL_DETECTED',
+        title: 'MINER FALL DETECTED',
+        message: `Helmet confirmed a fall (impact + no movement + tilt)${conf !== null && conf !== undefined ? `, AI confidence ${Math.round(conf * 100)}%` : ''}.`,
+        timestamp,
+        severity: 'critical',
+        acknowledged: false,
+        sensor: 'MPU-6050',
+        sound: 'critical',
+      });
+    }
+
+    // 1c. AI gas prediction (warns before the danger level is reached)
+    const gasAi = packet.ai?.gas;
+    if (gasAi && gasAi.timeToDangerSec !== null && gasAi.timeToDangerSec !== undefined && gasAi.timeToDangerSec <= 300) {
+      newAlerts.push({
+        id: `gas_pred_${Date.now()}`,
+        type: 'GAS_PREDICTION',
+        title: 'AI: GAS RISING TOWARDS DANGER',
+        message: `${gasAi.metric} rising ${gasAi.slopePerMin} ${gasAi.unit}/min. Danger level predicted in ~${Math.max(1, Math.round(gasAi.timeToDangerSec / 60))} min.`,
+        timestamp,
+        severity: 'warning',
+        acknowledged: false,
+        sensor: 'AI ENGINE',
+        sound: 'warning',
+      });
+    }
+    if (gasAi?.spike) {
+      newAlerts.push({
+        id: `gas_spike_${Date.now()}`,
+        type: 'GAS_SPIKE',
+        title: 'AI: SUDDEN GAS SPIKE',
+        message: `${gasAi.metric} jumped far above its recent average (z-score ${gasAi.zScore}).`,
+        timestamp,
+        severity: 'warning',
+        acknowledged: false,
+        sensor: 'AI ENGINE',
+        sound: 'warning',
+      });
+    }
+
+    // 2. Gas threshold check (helmet status first, raw ADC thresholds as fallback)
+    const adc = Math.max(packet.mq2?.rawAdc ?? 0, packet.mq4?.rawAdc ?? 0);
+    const level = packet.gasLevel ?? (packet.status === 'DANGER' ? 2 : packet.status === 'WARNING' ? 1 : null);
+    const helmetGas = level === 2 ? 'critical' : level === 1 ? 'warning' : null;
+    const helmetDecides = level !== null || Boolean(packet.status);
+    if (helmetGas || (packet.mq2?.rawAdc !== null && packet.mq2?.rawAdc !== undefined)) {
+      if (helmetGas === 'critical' || (!helmetDecides && adc >= thresholds.gasCritical)) {
         newAlerts.push({
           id: `gas_crit_${Date.now()}`,
           type: 'GAS_CRITICAL',
           title: 'DANGEROUS GAS / SMOKE LEAK',
-          message: `MQ-2 sensor exceeded critical threshold: ${adc} ADC.`,
+          message: `Gas sensors above danger level (MQ-2 ${packet.mq2?.rawAdc ?? '-'}, MQ-4 ${packet.mq4?.rawAdc ?? '-'} ADC).`,
           timestamp,
           severity: 'critical',
           acknowledged: false,
-          sensor: 'MQ-2',
+          sensor: 'MQ-2 / MQ-4',
+          sound: 'critical',
         });
-        soundEffects.playCriticalAlarm();
-      } else if (adc >= thresholds.gasWarning) {
+      } else if (helmetGas === 'warning' || (!helmetDecides && adc >= thresholds.gasWarning)) {
         newAlerts.push({
           id: `gas_warn_${Date.now()}`,
           type: 'GAS_WARNING',
           title: 'ELEVATED GAS READING',
-          message: `MQ-2 sensor above caution threshold: ${adc} ADC.`,
+          message: `Gas sensors above caution level (MQ-2 ${packet.mq2?.rawAdc ?? '-'}, MQ-4 ${packet.mq4?.rawAdc ?? '-'} ADC).`,
           timestamp,
           severity: 'warning',
           acknowledged: false,
-          sensor: 'MQ-2',
+          sensor: 'MQ-2 / MQ-4',
+          sound: 'warning',
         });
-        soundEffects.playWarningBeep();
       }
     }
 
@@ -197,14 +268,14 @@ export const TelemetryProvider = ({ children }) => {
         newAlerts.push({
           id: `shock_${Date.now()}`,
           type: 'HIGH_G_SHOCK',
-          title: 'HIGH G-FORCE IMPACT SHOCK',
-          message: `MPU-6050 registered shock acceleration of ${gForce.toFixed(2)}g.`,
+          title: 'IMPACT DETECTED',
+          message: `MPU-6050 registered ${gForce.toFixed(2)}g. The helmet checks for stillness before confirming a fall.`,
           timestamp,
-          severity: 'critical',
+          severity: 'warning',
           acknowledged: false,
           sensor: 'MPU-6050',
+          sound: 'warning',
         });
-        soundEffects.playCriticalAlarm();
       } else if (Math.abs(roll) > thresholds.tiltLimit || Math.abs(pitch) > thresholds.tiltLimit) {
         newAlerts.push({
           id: `tilt_${Date.now()}`,
@@ -215,19 +286,24 @@ export const TelemetryProvider = ({ children }) => {
           severity: 'warning',
           acknowledged: false,
           sensor: 'MPU-6050',
+          sound: 'warning',
         });
-        soundEffects.playWarningBeep();
       }
     }
 
-    // Append without spamming identical alerts within 4 seconds
-    if (newAlerts.length > 0) {
-      setAlerts(prev => {
-        const filteredNew = newAlerts.filter(na => {
-          return !prev.some(p => p.type === na.type && !p.acknowledged && (Date.now() - new Date(p.timestamp).getTime() < 4000));
-        });
-        return [...filteredNew, ...prev].slice(0, 50);
-      });
+    // Only raise each alert type once per 30 s while the condition continues, and only then play a sound
+    const nowMs = Date.now();
+    const fresh = newAlerts.filter((na) => {
+      const last = lastAlertAtRef.current[na.type] || 0;
+      if (nowMs - last < ALERT_REPEAT_MS) return false;
+      lastAlertAtRef.current[na.type] = nowMs;
+      return true;
+    });
+    if (fresh.length > 0) {
+      if (fresh.some((a) => a.sound === 'sos')) soundEffects.playSosAlarm();
+      else if (fresh.some((a) => a.sound === 'critical')) soundEffects.playCriticalAlarm();
+      else soundEffects.playWarningBeep();
+      setAlerts((prev) => [...fresh, ...prev].slice(0, 50));
     }
   }, [thresholds]);
 

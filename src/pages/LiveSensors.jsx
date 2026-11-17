@@ -29,6 +29,7 @@ import { Badge } from '../components/common/Badge';
 import { OrientationCube } from '../components/visualizers/OrientationCube';
 import { OledDisplaySim } from '../components/visualizers/OledDisplaySim';
 import { Esp32BoardPinout } from '../components/visualizers/Esp32BoardPinout';
+import { AiRiskPanel } from '../components/visualizers/AiRiskPanel';
 import {
   formatADC,
   formatPPM,
@@ -272,6 +273,9 @@ export const LiveSensors = () => {
         )}
       </section>
 
+      {/* AI RISK ENGINE: risk score, gas prediction, fall / SOS, helmet link */}
+      <AiRiskPanel packet={latestPacket} />
+
       {/* =================================================================== */}
       {/* 2. SENSOR CARDS GRID                                                */}
       {/* =================================================================== */}
@@ -489,8 +493,8 @@ export const LiveSensors = () => {
                   <Thermometer className="w-5 h-5" />
                 </div>
                 <div>
-                  <h2 className="text-sm font-bold text-slate-900">Temperature</h2>
-                  <div className="text-[11px] text-slate-500 font-mono">Onboard Sensor Telemetry</div>
+                  <h2 className="text-sm font-bold text-slate-900">Device Temperature</h2>
+                  <div className="text-[11px] text-slate-500 font-mono">MPU6050 chip sensor (not ambient air)</div>
                 </div>
               </div>
 

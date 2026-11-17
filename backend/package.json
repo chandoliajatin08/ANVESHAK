@@ -1,12 +1,13 @@
 {
   "name": "anveshak-ingestion-backend",
   "version": "1.0.0",
-  "description": "Secure Telemetry Ingestion Endpoint for ANVESHAK ESP32 using Firebase Admin SDK",
-  "main": "server.js",
+  "description": "ANVESHAK backend: LoRa/USB/Wi-Fi telemetry ingestion, AI risk engine and live stream for the dashboard",
+  "main": "anveshak-server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node anveshak-server.js",
+    "dev": "node --watch anveshak-server.js",
+    "test:ai": "node test-ai.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

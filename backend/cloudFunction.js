@@ -29,7 +29,7 @@ export const ingestTelemetry = functions
     }
 
     // 2. Authenticate Device via Pre-shared Key
-    const configuredKey = process.env.DEVICE_KEY || 'anveshak_sec_key_esp32_01';
+    const configuredKey = process.env.DEVICE_KEY; // set DEVICE_KEY in the function's environment
     const incomingKey = req.headers['x-device-key'];
 
     if (!incomingKey || incomingKey !== configuredKey) {
